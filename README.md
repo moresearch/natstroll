@@ -150,7 +150,7 @@ The hub detects the first spoke and starts exchanging jokes. You'll see joke req
 | `OLLAMA_HOST` | hub, spoke | `http://localhost:11434` | Ollama API base URL. |
 | `NATS_ACCOUNT_SEED` | hub | *(none)* | Account seed for signing dynamic user credentials. |
 | `NATSTROLL_WRITE_HUB_CREDS` | hub | *(none)* | If set, write hub credentials to this path for debugging. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | hub, spoke | hub: `localhost:4317` | OTLP collector endpoint. If unset in the spoke, OTel is disabled. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | hub, spoke | *(none)* | OTLP collector endpoint. If unset, OTel is disabled (no trace export). |
 | `OTEL_EXPORTER_OTLP_INSECURE` | hub, spoke | `true` | Use insecure gRPC when `true`. Set to `false` for production collectors with TLS. |
 | `REGISTRAR_CREDS_B64` | spoke | *(none)* | Base64-encoded registrar credentials from the hub's first-run output. |
 | `SPOKE_ID` | spoke | hostname | Unique identifier for this spoke. |
@@ -300,17 +300,9 @@ nats --server nats://127.0.0.1:4222 --creds /tmp/natstroll-hub.creds sub 'heartb
 
 ## OpenTelemetry
 
-Both binaries can export OTLP traces. The hub defaults to `localhost:4317`; the spoke only initializes OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
+Both binaries support OTLP trace export. It is **opt-in** — set `OTEL_EXPORTER_OTLP_ENDPOINT` to enable. When unset, no trace export is attempted and no OTel-related log noise appears.
 
 Resource attributes include `service.name`, `service.version`, and `host.name`. Trace context is propagated through NATS message headers, linking hub and spoke spans.
-
-If no collector is running, you may see:
-
-```text
-time=... level=ERROR component=hub msg="OTel init failed" error="..."
-```
-
-That does not break NATS or Ollama. It only means trace export failed.
 
 To run with a local collector:
 
@@ -348,23 +340,33 @@ Check:
 - The system account JWT exists in the resolver directory.
 - The config includes `system_account: "<system-account-public-key>"`.
 
+### Empty joke or reply
+
+Thinking models like `deepseek-r1:1.5b` spend tokens on internal chain-of-thought before producing the final answer. If `num_predict` is too low, all tokens go to reasoning and the visible output is empty.
+
+The code handles this by:
+
+- Prefixing prompts with "Return only the final answer. Do not think out loud."
+- Using generous `num_predict` budgets (hub: 256, spoke: 256)
+- Falling back to a deterministic reply if Ollama returns empty
+
+If you still see empty output, try a non-thinking model or increase `num_predict` further.
+
 ### `context deadline exceeded`
 
 The Ollama request timed out (hub: 60s, spoke: 60s). The hub waits an additional 15s for the spoke's reply (75s total).
 
-Usually this means the model is too slow, especially if using a thinking model.
-
 Fixes:
 
 - Use a faster non-thinking model.
-- Set `num_predict` to a smaller value in the source.
+- Increase `OllamaTimeout` in the source.
 - Use a shorter prompt.
 
 Default Ollama options used by this demo:
 
 | Component | `temperature` | `num_predict` |
 |-----------|---------------|---------------|
-| Hub       | 0.9           | 60            |
+| Hub       | 0.9           | 256           |
 | Spoke     | 0.7           | 256           |
 
 ### `no servers available for connection`

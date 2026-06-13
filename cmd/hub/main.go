@@ -428,11 +428,19 @@ func generateJoke(ctx context.Context, prompt string) (string, error) {
 
 	span.SetAttributes(attribute.String("prompt", prompt))
 
+	// Prefix to suppress chain-of-thought from thinking models (deepseek-r1).
+	// Without this, the model may spend all num_predict tokens on reasoning
+	// and return an empty final answer.
+	fullPrompt := fmt.Sprintf("Return only the final answer. Do not think out loud.\n\n%s", prompt)
+
 	req := &api.GenerateRequest{
-		Model:   ollamaModel,
-		Prompt:  prompt,
-		Options: map[string]any{"temperature": 0.9, "num_predict": 60},
-		Stream:  nil,
+		Model:  ollamaModel,
+		Prompt: fullPrompt,
+		Options: map[string]any{
+			"temperature": 0.9,
+			"num_predict": 256,
+		},
+		Stream: nil,
 	}
 
 	var response string
@@ -440,8 +448,16 @@ func generateJoke(ctx context.Context, prompt string) (string, error) {
 		response += resp.Response
 		return nil
 	})
+	if err != nil {
+		return "", err
+	}
 
-	return strings.TrimSpace(response), err
+	reply := strings.TrimSpace(response)
+	if reply == "" {
+		return "", fmt.Errorf("ollama returned an empty reply (model may need more num_predict budget for thinking)")
+	}
+
+	return reply, nil
 }
 
 func startConversation(ctx context.Context, js nats.JetStreamContext, targetSpokeID string, nc *nats.Conn) {
@@ -555,16 +571,17 @@ func main() {
 	defer stop()
 
 	otelEndpoint := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
-	if otelEndpoint == "" {
-		otelEndpoint = "localhost:4317"
-	}
 	otelInsecure := strings.ToLower(os.Getenv("OTEL_EXPORTER_OTLP_INSECURE")) != "false"
 
 	var shutdownTracer func(context.Context) error
 	var err error
-	tracer, shutdownTracer, err = shared.InitOpenTelemetry("joke-hub", otelEndpoint, otelInsecure)
-	if err != nil {
-		logger.Error("OTel init failed", "error", err)
+	if otelEndpoint != "" {
+		tracer, shutdownTracer, err = shared.InitOpenTelemetry("joke-hub", otelEndpoint, otelInsecure)
+		if err != nil {
+			logger.Error("OTel init failed", "error", err)
+		}
+	} else {
+		shutdownTracer = func(context.Context) error { return nil }
 	}
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
