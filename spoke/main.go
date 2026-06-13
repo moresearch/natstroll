@@ -36,7 +36,11 @@ import (
 const (
 	JokeStream         = "JOKE_STREAM"
 	JokeRequestSubject = "joke.request."
-	OllamaTimeout      = 600 * time.Second
+
+	// Keep this below the hub's reply timeout. The hub currently waits
+	// OllamaTimeout + 15s, so this spoke should either produce a reply or return
+	// a fallback before that window closes.
+	OllamaTimeout = 60 * time.Second
 )
 
 type JokeRequest struct {
@@ -61,9 +65,7 @@ type RegisterResponse struct {
 
 var tracer trace.Tracer
 var ollamaClient *api.Client
-
-// var modelName = "deepseek-r1:1.5b"
-var modelName = "qwen3.5:0.8b"
+var modelName = "deepseek-r1:1.5b"
 
 func die(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
@@ -182,6 +184,15 @@ func sleepOrDone(ctx context.Context, d time.Duration) error {
 	}
 }
 
+func fallbackReply(joke string) string {
+	joke = strings.TrimSpace(joke)
+	if joke == "" {
+		return "That joke vanished faster than a paper airplane in a storm."
+	}
+
+	return "That joke took off about as well as a cat’s paper airplane."
+}
+
 func generateJokeReply(ctx context.Context, joke string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, OllamaTimeout)
 	defer cancel()
@@ -191,14 +202,30 @@ func generateJokeReply(ctx context.Context, joke string) (string, error) {
 
 	span.SetAttributes(attribute.String("joke", joke))
 
-	prompt := fmt.Sprintf(`You are a witty AI. The user told you this joke: "%s"
-Your task: Consider the received joke carefully. Then craft a response joke. It can be a follow-up joke, a pun, a twist, or a clever comeback that plays on the original joke. Your reply must be short, max 2 sentences, and funny.`, joke)
+	// Thinking models may spend tokens on hidden or visible reasoning before
+	// producing the final answer. The prompt asks for only final output, and
+	// num_predict gives enough budget to reach that final answer.
+	prompt := fmt.Sprintf(`Return only the final answer. Do not think out loud.
+
+Reply to this joke with one short funny comeback.
+
+Joke:
+%s
+
+Rules:
+- max 2 sentences
+- no explanation
+- no reasoning text
+- output only the comeback`, joke)
 
 	req := &api.GenerateRequest{
-		Model:   modelName,
-		Prompt:  prompt,
-		Options: map[string]any{"temperature": 0.5, "num_predict": 80},
-		Stream:  nil,
+		Model:  modelName,
+		Prompt: prompt,
+		Options: map[string]any{
+			"temperature": 0.7,
+			"num_predict": 256,
+		},
+		Stream: nil,
 	}
 
 	var response string
@@ -206,8 +233,16 @@ Your task: Consider the received joke carefully. Then craft a response joke. It 
 		response += resp.Response
 		return nil
 	})
+	if err != nil {
+		return "", err
+	}
 
-	return strings.TrimSpace(response), err
+	reply := strings.TrimSpace(response)
+	if reply == "" {
+		return "", fmt.Errorf("ollama returned an empty reply")
+	}
+
+	return reply, nil
 }
 
 func ensureConsumer(ctx context.Context, js nats.JetStreamContext, filterSubject, consumerName string) error {
@@ -314,7 +349,8 @@ func processMessage(nc *nats.Conn, spokeID string, msg *nats.Msg) {
 
 	reply, err := generateJokeReply(msgCtx, jokeReq.Joke)
 	if err != nil {
-		reply = fmt.Sprintf("Sorry, couldn't reply: %v", err)
+		slog.Warn("ollama reply failed; using deterministic fallback", "error", err)
+		reply = fallbackReply(jokeReq.Joke)
 	}
 
 	fmt.Printf("Spoke generated reply: %s\n", reply)
@@ -385,8 +421,11 @@ func runConsumer(ctx context.Context, sub *nats.Subscription, nc *nats.Conn, spo
 func main() {
 	initLogger()
 
-	if err := initOpenTelemetry("joke-spoke", "localhost:4317"); err != nil {
-		slog.Error("OTel init failed", "error", err)
+	tracer = otel.Tracer("joke-spoke")
+	if endpoint := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")); endpoint != "" {
+		if err := initOpenTelemetry("joke-spoke", endpoint); err != nil {
+			slog.Error("OTel init failed", "error", err)
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
