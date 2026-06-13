@@ -78,21 +78,25 @@ This is a lab/demo, not a production security profile.
 
 ```text
 natstroll/
-  shared/
-    shared.go          — common types, helpers, OpenTelemetry setup
-    shared_test.go     — tests for shared package
-    go.mod / go.sum
-  hub/
-    main.go            — embedded NATS server, JWT issuer, joke orchestrator
-    go.mod / go.sum
-  spoke/
-    main.go            — registration, JetStream consumer, Ollama reply generation
-    go.mod / go.sum
+  cmd/
+    hub/
+      main.go            — embedded NATS server, JWT issuer, joke orchestrator
+      main_test.go       — hub unit tests
+    spoke/
+      main.go            — registration, JetStream consumer, Ollama reply generation
+      main_test.go       — spoke unit tests
+  internal/
+    shared/
+      shared.go          — common types, helpers, OpenTelemetry setup
+      shared_test.go     — shared package tests
+      example_test.go    — runnable usage examples
+  Makefile               — build, test, release targets
+  go.mod / go.sum        — single Go module
   .gitignore
   README.md
 ```
 
-Each component is an independent Go module. Hub and spoke both reference `shared` via a `replace` directive in their `go.mod` files.
+A single Go module (`github.com/moresearch/natstroll`) with the standard `cmd/` + `internal/` layout. The `internal/shared` package is compiler-enforced private — only code within this module can import it.
 
 ## Requirements
 
@@ -113,27 +117,27 @@ For faster tests, use a non-thinking model or reduce generation with `num_predic
 In one terminal, bootstrap and start the hub:
 
 ```bash
-cd hub
+cd natstroll
 
 # Generate secrets (first time only)
 unset NATS_ACCOUNT_SEED REGISTRAR_CREDS_B64
-go run main.go
+go run ./cmd/hub
 # → copy the two export lines printed
 
 # Start the hub with those secrets
 export NATS_ACCOUNT_SEED="..."
 export REGISTRAR_CREDS_B64="..."
-go run main.go
+go run ./cmd/hub
 ```
 
 In another terminal, start a spoke:
 
 ```bash
-cd spoke
+cd natstroll
 export NATS_URL=nats://127.0.0.1:4222
 export REGISTRAR_CREDS_B64="..."  # paste the value from the hub
 export SPOKE_ID=black-spoke
-go run main.go
+go run ./cmd/spoke
 ```
 
 The hub detects the first spoke and starts exchanging jokes. You'll see joke requests and AI-generated replies in both terminals.
@@ -154,38 +158,49 @@ The hub detects the first spoke and starts exchanging jokes. You'll see joke req
 
 ## Building
 
-Build standalone binaries from each module directory:
-
 ```bash
-cd hub && go build -o hub
-cd spoke && go build -o spoke
+# Build both binaries for the current platform
+make build
+# → bin/natstroll-hub, bin/natstroll-spoke
+
+# Or build individually
+make hub      # → bin/natstroll-hub
+make spoke    # → bin/natstroll-spoke
 ```
 
-The binaries can then be run directly:
+**Cross-compile distributable binaries** for Linux and Windows (amd64 + arm64):
 
 ```bash
-cd hub && ./hub
-cd spoke && ./spoke
+make release
+# → dist/natstroll-hub-linux-amd64    dist/natstroll-spoke-linux-amd64
+#   dist/natstroll-hub-linux-arm64    dist/natstroll-spoke-linux-arm64
+#   dist/natstroll-hub-windows-amd64.exe  dist/natstroll-spoke-windows-amd64.exe
+#   dist/natstroll-hub-windows-arm64.exe  dist/natstroll-spoke-windows-arm64.exe
+
+# With SHA256 checksums
+make checksums
 ```
 
-Pre-built binaries may already exist at `hub/hub` and `spoke/spoke`.
+Binaries are stripped (`-s -w`) and include version, commit, and build timestamp via linker flags.
+
+Run `make help` for all targets.
 
 ## Running tests
 
 ```bash
-cd shared && go test ./...
+make test          # all tests
+make test-verbose  # verbose output
+make cover         # with coverage report
+make vet           # static analysis
 ```
-
-Tests cover the shared package: log level parsing, spoke ID validation, safe-name generation, consumer name helpers, temporary credential file writing, and JSON round-trips for all message types.
 
 ## Start the hub
 
 First generate fresh NATS bootstrap credentials:
 
 ```bash
-cd hub
 unset NATS_ACCOUNT_SEED REGISTRAR_CREDS_B64
-go run main.go
+go run ./cmd/hub
 ```
 
 The hub prints two export lines:
@@ -198,7 +213,7 @@ export REGISTRAR_CREDS_B64="..."
 Paste those exports into the same terminal, then start the hub:
 
 ```bash
-go run main.go
+go run ./cmd/hub
 ```
 
 Expected output:
@@ -217,11 +232,10 @@ Spokes will automatically register and then the joke exchange will start.
 Open another terminal:
 
 ```bash
-cd spoke
 export NATS_URL=nats://127.0.0.1:4222
 export REGISTRAR_CREDS_B64="PASTE_THE_VALUE_PRINTED_BY_THE_HUB"
 export SPOKE_ID=black-spoke
-go run main.go
+go run ./cmd/spoke
 ```
 
 Expected output:
@@ -246,11 +260,10 @@ Only the **first** spoke to register participates in the joke conversation loop.
 To start a second spoke:
 
 ```bash
-cd spoke
 export NATS_URL=nats://127.0.0.1:4222
 export REGISTRAR_CREDS_B64="..."  # same registrar creds
 export SPOKE_ID=red-spoke          # different ID
-go run main.go
+go run ./cmd/spoke
 ```
 
 ## Spy on traffic
@@ -258,10 +271,9 @@ go run main.go
 To inspect traffic from outside, tell the hub to write debug credentials by setting `NATSTROLL_WRITE_HUB_CREDS` to the path you want:
 
 ```bash
-cd hub
 export NATSTROLL_WRITE_HUB_CREDS=/tmp/natstroll-hub.creds
 # ... also export NATS_ACCOUNT_SEED and REGISTRAR_CREDS_B64
-go run main.go
+go run ./cmd/hub
 ```
 
 Then use one command to create a separate spy consumer and continuously read stored messages:
@@ -306,12 +318,12 @@ To run with a local collector:
 # hub
 export OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317
 export OTEL_EXPORTER_OTLP_INSECURE=true
-cd hub && go run main.go
+go run ./cmd/hub
 
 # spoke
 export OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317
 export OTEL_EXPORTER_OTLP_INSECURE=true
-cd spoke && go run main.go
+go run ./cmd/spoke
 ```
 
 ## Common errors

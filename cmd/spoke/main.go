@@ -21,7 +21,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	"natstroll/shared"
+	"github.com/moresearch/natstroll/internal/shared"
 )
 
 // Spoke registers with the hub, receives dynamic NATS user credentials, creates

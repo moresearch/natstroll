@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"natstroll/shared"
+	"github.com/moresearch/natstroll/internal/shared"
 )
 
 func ExampleJokeRequest_roundTrip() {

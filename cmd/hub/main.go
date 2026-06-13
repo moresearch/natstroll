@@ -26,7 +26,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	"natstroll/shared"
+	"github.com/moresearch/natstroll/internal/shared"
 )
 
 // Hub owns the local NATS lab environment.

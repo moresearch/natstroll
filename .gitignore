@@ -8,11 +8,8 @@ build/
 *.cover
 coverage.out
 
-# Local binaries
-hub
-spoke
-natstroll
-main
+# Local binaries — build output goes to bin/
+# (bin/ is already gitignored above under "Go build/test artifacts")
 
 # Go workspace/local env
 go.work
