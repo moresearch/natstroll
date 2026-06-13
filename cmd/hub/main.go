@@ -23,6 +23,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 	"github.com/ollama/ollama/api"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
@@ -580,7 +581,11 @@ func main() {
 		if err != nil {
 			logger.Error("OTel init failed", "error", err)
 		}
-	} else {
+	}
+	if tracer == nil {
+		// No OTel configured — use the global no-op tracer so calls like
+		// tracer.Start() don't panic on a nil interface.
+		tracer = otel.Tracer("joke-hub")
 		shutdownTracer = func(context.Context) error { return nil }
 	}
 	defer func() {
