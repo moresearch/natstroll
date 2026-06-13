@@ -1,32 +1,64 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-
-# Test binary, built with `go test -c`
+# Go build/test artifacts
+bin/
+dist/
+build/
 *.test
-
-# Code coverage profiles and other test artifacts
 *.out
-coverage.*
-*.coverprofile
-profile.cov
+*.prof
+*.cover
+coverage.out
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
+# Local binaries
+hub
+spoke
+natstroll
+main
 
-# Go workspace file
+# Go workspace/local env
 go.work
 go.work.sum
-
-# env file
 .env
+.env.*
+!.env.example
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# NATS credentials and secrets
+*.creds
+*.nk
+*.jwt
+*.seed
+*nats*.conf
+natstroll-hub.creds
+
+# Embedded NATS / JetStream data
+nats-*/
+jetstream/
+store/
+data/
+*.db
+*.ldb
+*.log
+*.sst
+*.tmp
+
+# Logs
+logs/
+*.log
+
+# OpenTelemetry / local observability data
+otel-data/
+tempo-data/
+prometheus-data/
+grafana-data/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Generated temp files
+tmp/
+temp/
+.cache/
