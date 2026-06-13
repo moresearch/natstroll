@@ -17,13 +17,11 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/ollama/ollama/api"
-
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
-	"go.opentelemetry.io/otel/propagation"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
+
+	"natstroll/shared"
 )
 
 // Spoke registers with the hub, receives dynamic NATS user credentials, creates
@@ -34,131 +32,16 @@ import (
 // a dynamically issued credential can exercise JetStream management APIs.
 
 const (
-	JokeStream         = "JOKE_STREAM"
-	JokeRequestSubject = "joke.request."
-
 	// Keep this below the hub's reply timeout. The hub currently waits
 	// OllamaTimeout + 15s, so this spoke should either produce a reply or return
 	// a fallback before that window closes.
 	OllamaTimeout = 60 * time.Second
 )
 
-type JokeRequest struct {
-	RequestID   string `json:"request_id"`
-	Joke        string `json:"joke"`
-	FromSpokeID string `json:"from_spoke_id"`
-}
-
-type JokeResponse struct {
-	RequestID     string `json:"request_id"`
-	Reply         string `json:"reply"`
-	ReplyingSpoke string `json:"replying_spoke"`
-}
-
-type RegisterRequest struct {
-	SpokeID string `json:"spoke_id"`
-}
-
-type RegisterResponse struct {
-	CredsData string `json:"creds_data"`
-}
-
-var tracer trace.Tracer
+var logger *slog.Logger
+var tracer trace.Tracer = otel.Tracer("joke-spoke")
 var ollamaClient *api.Client
 var modelName = "deepseek-r1:1.5b"
-
-func die(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
-	os.Exit(1)
-}
-
-func initLogger() {
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	})))
-}
-
-func initOpenTelemetry(serviceName, collectorEndpoint string) error {
-	tracer = otel.Tracer(serviceName)
-
-	ctx := context.Background()
-	exporter, err := otlptracegrpc.New(ctx,
-		otlptracegrpc.WithEndpoint(collectorEndpoint),
-		otlptracegrpc.WithInsecure(),
-	)
-	if err != nil {
-		return err
-	}
-
-	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(exporter))
-	otel.SetTracerProvider(tp)
-	otel.SetTextMapPropagator(propagation.TraceContext{})
-	tracer = tp.Tracer(serviceName)
-
-	return nil
-}
-
-func injectTraceContext(ctx context.Context, msg *nats.Msg) {
-	if msg.Header == nil {
-		msg.Header = nats.Header{}
-	}
-	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(msg.Header))
-}
-
-func extractTraceContext(msg *nats.Msg) context.Context {
-	return otel.GetTextMapPropagator().Extract(context.Background(), propagation.HeaderCarrier(msg.Header))
-}
-
-func validateSpokeID(id string) error {
-	if id == "" {
-		return fmt.Errorf("spoke id is empty")
-	}
-
-	if strings.HasPrefix(id, ".") || strings.HasSuffix(id, ".") || strings.Contains(id, "..") {
-		return fmt.Errorf("spoke id %q would create an empty NATS subject token", id)
-	}
-
-	for _, r := range id {
-		switch {
-		case r >= 'a' && r <= 'z':
-		case r >= 'A' && r <= 'Z':
-		case r >= '0' && r <= '9':
-		case r == '-', r == '_', r == '.':
-		default:
-			return fmt.Errorf("spoke id %q contains invalid character %q", id, r)
-		}
-	}
-
-	return nil
-}
-
-func safeName(s string) string {
-	replacer := strings.NewReplacer(".", "_", "-", "_", ":", "_", "/", "_", "\\", "_")
-	return replacer.Replace(s)
-}
-
-func consumerNameForSpoke(id string) string {
-	return "joke_consumer_" + safeName(id)
-}
-
-func writeTempCreds(prefix string, creds []byte) (string, error) {
-	f, err := os.CreateTemp("", safeName(prefix)+"-*.creds")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	if _, err := f.Write(creds); err != nil {
-		_ = os.Remove(f.Name())
-		return "", err
-	}
-	if err := f.Chmod(0600); err != nil {
-		_ = os.Remove(f.Name())
-		return "", err
-	}
-
-	return f.Name(), nil
-}
 
 func isFatalNATSError(err error) bool {
 	if err == nil {
@@ -258,20 +141,20 @@ func ensureConsumer(ctx context.Context, js nats.JetStreamContext, filterSubject
 	var lastErr error
 
 	for attempt := 1; attempt <= 5; attempt++ {
-		info, err := js.AddConsumer(JokeStream, cfg)
+		info, err := js.AddConsumer(shared.JokeStream, cfg)
 		if err == nil {
-			slog.Info("consumer ready", "consumer", info.Name, "filter", filterSubject)
+			logger.Info("consumer ready", "consumer", info.Name, "filter", filterSubject)
 			return nil
 		}
 
 		lastErr = err
 
-		info, infoErr := js.ConsumerInfo(JokeStream, consumerName)
+		info, infoErr := js.ConsumerInfo(shared.JokeStream, consumerName)
 		if infoErr == nil {
 			if info.Config.FilterSubject != "" && info.Config.FilterSubject != filterSubject {
 				return fmt.Errorf("consumer %s exists with filter %q, expected %q", consumerName, info.Config.FilterSubject, filterSubject)
 			}
-			slog.Info("consumer already exists", "consumer", consumerName, "filter", filterSubject)
+			logger.Info("consumer already exists", "consumer", consumerName, "filter", filterSubject)
 			return nil
 		}
 
@@ -279,7 +162,7 @@ func ensureConsumer(ctx context.Context, js nats.JetStreamContext, filterSubject
 			return fmt.Errorf("fatal consumer creation error: %w", err)
 		}
 
-		slog.Warn("failed to add consumer; retrying", "attempt", attempt, "error", err)
+		logger.Warn("failed to add consumer; retrying", "attempt", attempt, "error", err)
 
 		if err := sleepOrDone(ctx, time.Duration(attempt)*time.Second); err != nil {
 			return err
@@ -300,7 +183,7 @@ func bindPullConsumer(ctx context.Context, js nats.JetStreamContext, filterSubje
 		sub, err := js.PullSubscribe(
 			filterSubject,
 			consumerName,
-			nats.BindStream(JokeStream),
+			nats.BindStream(shared.JokeStream),
 			nats.ManualAck(),
 		)
 		if err == nil {
@@ -313,7 +196,7 @@ func bindPullConsumer(ctx context.Context, js nats.JetStreamContext, filterSubje
 			return nil, fmt.Errorf("fatal pull subscribe error: %w", err)
 		}
 
-		slog.Warn("failed to bind pull consumer; retrying", "attempt", attempt, "error", err)
+		logger.Warn("failed to bind pull consumer; retrying", "attempt", attempt, "error", err)
 
 		if err := sleepOrDone(ctx, time.Duration(attempt)*time.Second); err != nil {
 			return nil, err
@@ -324,38 +207,38 @@ func bindPullConsumer(ctx context.Context, js nats.JetStreamContext, filterSubje
 }
 
 func processMessage(nc *nats.Conn, spokeID string, msg *nats.Msg) {
-	msgCtx := extractTraceContext(msg)
+	msgCtx := shared.ExtractTraceContext(msg)
 
-	var jokeReq JokeRequest
+	var jokeReq shared.JokeRequest
 	if err := json.Unmarshal(msg.Data, &jokeReq); err != nil {
-		slog.Error("failed to unmarshal joke", "error", err)
+		logger.Error("failed to unmarshal joke", "error", err)
 		_ = msg.Term()
 		return
 	}
 
 	if strings.TrimSpace(jokeReq.RequestID) == "" {
-		slog.Error("invalid joke request: empty request id")
+		logger.Error("invalid joke request: empty request id")
 		_ = msg.Term()
 		return
 	}
 
 	if strings.TrimSpace(msg.Reply) == "" {
-		slog.Error("invalid joke request: empty reply subject", "request_id", jokeReq.RequestID)
+		logger.Error("invalid joke request: empty reply subject", "request_id", jokeReq.RequestID)
 		_ = msg.Term()
 		return
 	}
 
-	fmt.Printf("Spoke received joke: %s\n", jokeReq.Joke)
+	logger.Info("received joke", "request_id", jokeReq.RequestID, "joke", jokeReq.Joke)
 
 	reply, err := generateJokeReply(msgCtx, jokeReq.Joke)
 	if err != nil {
-		slog.Warn("ollama reply failed; using deterministic fallback", "error", err)
+		logger.Warn("ollama reply failed; using deterministic fallback", "request_id", jokeReq.RequestID, "error", err)
 		reply = fallbackReply(jokeReq.Joke)
 	}
 
-	fmt.Printf("Spoke generated reply: %s\n", reply)
+	logger.Info("generated reply", "request_id", jokeReq.RequestID, "reply", reply)
 
-	resp := JokeResponse{
+	resp := shared.JokeResponse{
 		RequestID:     jokeReq.RequestID,
 		Reply:         reply,
 		ReplyingSpoke: spokeID,
@@ -363,7 +246,7 @@ func processMessage(nc *nats.Conn, spokeID string, msg *nats.Msg) {
 
 	respBytes, err := json.Marshal(resp)
 	if err != nil {
-		slog.Error("failed to marshal joke response", "error", err)
+		logger.Error("failed to marshal joke response", "request_id", jokeReq.RequestID, "error", err)
 		_ = msg.Term()
 		return
 	}
@@ -373,22 +256,22 @@ func processMessage(nc *nats.Conn, spokeID string, msg *nats.Msg) {
 		Data:    respBytes,
 		Header:  nats.Header{},
 	}
-	injectTraceContext(msgCtx, respMsg)
+	shared.InjectTraceContext(msgCtx, respMsg)
 
 	if err := nc.PublishMsg(respMsg); err != nil {
-		slog.Error("failed to send reply", "error", err)
+		logger.Error("failed to send reply", "request_id", jokeReq.RequestID, "error", err)
 		_ = msg.Nak()
 		return
 	}
 
 	if err := nc.FlushTimeout(2 * time.Second); err != nil {
-		slog.Error("failed to flush reply", "error", err)
+		logger.Error("failed to flush reply", "request_id", jokeReq.RequestID, "error", err)
 		_ = msg.Nak()
 		return
 	}
 
 	if err := msg.Ack(); err != nil {
-		slog.Error("failed to ack message", "error", err)
+		logger.Error("failed to ack message", "request_id", jokeReq.RequestID, "error", err)
 	}
 }
 
@@ -408,7 +291,7 @@ func runConsumer(ctx context.Context, sub *nats.Subscription, nc *nats.Conn, spo
 			if isFatalNATSError(err) {
 				return fmt.Errorf("fatal fetch error: %w", err)
 			}
-			slog.Warn("fetch failed; continuing", "error", err)
+			logger.Warn("fetch failed; continuing", "error", err)
 			continue
 		}
 
@@ -419,17 +302,27 @@ func runConsumer(ctx context.Context, sub *nats.Subscription, nc *nats.Conn, spo
 }
 
 func main() {
-	initLogger()
-
-	tracer = otel.Tracer("joke-spoke")
-	if endpoint := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")); endpoint != "" {
-		if err := initOpenTelemetry("joke-spoke", endpoint); err != nil {
-			slog.Error("OTel init failed", "error", err)
-		}
-	}
+	logger = shared.InitLogger("spoke")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	shutdownTracer := func(context.Context) error { return nil }
+	if endpoint := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")); endpoint != "" {
+		otelInsecure := strings.ToLower(os.Getenv("OTEL_EXPORTER_OTLP_INSECURE")) != "false"
+		var err error
+		tracer, shutdownTracer, err = shared.InitOpenTelemetry("joke-spoke", endpoint, otelInsecure)
+		if err != nil {
+			logger.Error("OTel init failed", "error", err)
+		}
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := shutdownTracer(shutdownCtx); err != nil {
+			logger.Error("OTel shutdown failed", "error", err)
+		}
+	}()
 
 	natsURL := os.Getenv("NATS_URL")
 	registrarCredsB64 := os.Getenv("REGISTRAR_CREDS_B64")
@@ -440,9 +333,11 @@ func main() {
 		spokeID = strings.TrimSpace(host)
 	}
 
-	if err := validateSpokeID(spokeID); err != nil {
-		die("invalid SPOKE_ID: %v", err)
+	if err := shared.ValidateSpokeID(spokeID); err != nil {
+		shared.Die("invalid SPOKE_ID: %v", err)
 	}
+
+	logger = logger.With("spoke_id", spokeID)
 
 	ollamaHost := os.Getenv("OLLAMA_HOST")
 	if ollamaHost == "" {
@@ -450,83 +345,83 @@ func main() {
 	}
 
 	if natsURL == "" || registrarCredsB64 == "" {
-		die("missing NATS_URL or REGISTRAR_CREDS_B64")
+		shared.Die("missing NATS_URL or REGISTRAR_CREDS_B64")
 	}
 
 	registrarCredsData, err := base64.StdEncoding.DecodeString(registrarCredsB64)
 	if err != nil {
-		die("failed to decode REGISTRAR_CREDS_B64: %v", err)
+		shared.Die("failed to decode REGISTRAR_CREDS_B64: %v", err)
 	}
 
-	registrarCredsFile, err := writeTempCreds("registrar", registrarCredsData)
+	registrarCredsFile, err := shared.WriteTempCreds("registrar", registrarCredsData)
 	if err != nil {
-		die("failed to write registrar credentials file: %v", err)
+		shared.Die("failed to write registrar credentials file: %v", err)
 	}
 	defer os.Remove(registrarCredsFile)
 
-	fmt.Println("Spoke registering with hub...")
+	logger.Info("registering with hub")
 
 	ncReg, err := nats.Connect(
 		natsURL,
 		nats.Name("joke-spoke-registrar-"+spokeID),
 		nats.UserCredentials(registrarCredsFile),
 		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
-			slog.Error("registrar NATS async error", "error", err)
+			logger.Error("registrar NATS async error", "error", err)
 		}),
 	)
 	if err != nil {
-		die("registrar connection failed: %v", err)
+		shared.Die("registrar connection failed: %v", err)
 	}
 	defer ncReg.Close()
 
-	regReq := RegisterRequest{SpokeID: spokeID}
+	regReq := shared.RegisterRequest{SpokeID: spokeID}
 	reqData, err := json.Marshal(regReq)
 	if err != nil {
-		die("failed to marshal registration request: %v", err)
+		shared.Die("failed to marshal registration request: %v", err)
 	}
 
 	respMsg, err := ncReg.Request("reg.request", reqData, 5*time.Second)
 	if err != nil {
-		die("registration request failed: %v", err)
+		shared.Die("registration request failed: %v", err)
 	}
 
-	var regResp RegisterResponse
+	var regResp shared.RegisterResponse
 	if err := json.Unmarshal(respMsg.Data, &regResp); err != nil {
-		die("invalid registration response: %v", err)
+		shared.Die("invalid registration response: %v", err)
 	}
 	if strings.TrimSpace(regResp.CredsData) == "" {
-		die("empty credentials received")
+		shared.Die("empty credentials received")
 	}
 
-	spokeCredsFile, err := writeTempCreds("spoke-"+safeName(spokeID), []byte(regResp.CredsData))
+	spokeCredsFile, err := shared.WriteTempCreds("spoke-"+shared.SafeName(spokeID), []byte(regResp.CredsData))
 	if err != nil {
-		die("failed to write spoke credentials file: %v", err)
+		shared.Die("failed to write spoke credentials file: %v", err)
 	}
 	defer os.Remove(spokeCredsFile)
 
-	fmt.Println("Spoke registered and received dynamic credentials")
+	logger.Info("registered and received dynamic credentials")
 
 	nc, err := nats.Connect(
 		natsURL,
 		nats.Name("joke-spoke-"+spokeID),
 		nats.UserCredentials(spokeCredsFile),
 		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
-			slog.Error("spoke NATS async error", "error", err)
+			logger.Error("spoke NATS async error", "error", err)
 		}),
 	)
 	if err != nil {
-		die("main connection failed: %v", err)
+		shared.Die("main connection failed: %v", err)
 	}
 	defer nc.Close()
 
 	js, err := nc.JetStream()
 	if err != nil {
-		die("JetStream context error: %v", err)
+		shared.Die("JetStream context error: %v", err)
 	}
 
 	ollamaURL, err := url.Parse(ollamaHost)
 	if err != nil {
-		die("invalid OLLAMA_HOST: %v", err)
+		shared.Die("invalid OLLAMA_HOST: %v", err)
 	}
 	ollamaClient = api.NewClient(ollamaURL, http.DefaultClient)
 
@@ -540,43 +435,43 @@ func main() {
 				return
 			case <-ticker.C:
 				if err := nc.Publish("heartbeat."+spokeID, []byte(`{"status":"alive"}`)); err != nil {
-					slog.Error("heartbeat publish failed", "error", err)
+					logger.Error("heartbeat publish failed", "error", err)
 					continue
 				}
 				if err := nc.FlushTimeout(2 * time.Second); err != nil {
-					slog.Error("heartbeat flush failed", "error", err)
+					logger.Error("heartbeat flush failed", "error", err)
 					continue
 				}
-				fmt.Println("Heartbeat sent")
+				logger.Info("heartbeat sent")
 			}
 		}
 	}()
 
-	filterSubject := JokeRequestSubject + spokeID
-	consumerName := consumerNameForSpoke(spokeID)
+	filterSubject := shared.JokeRequestSubject + spokeID
+	consumerName := shared.ConsumerNameForSpoke(spokeID)
 
 	consumer, err := bindPullConsumer(ctx, js, filterSubject, consumerName)
 	if err != nil {
-		die("failed to initialize pull consumer: %v", err)
+		shared.Die("failed to initialize pull consumer: %v", err)
 	}
 
-	fmt.Printf("Spoke listening for jokes on %s with durable consumer %s\n", filterSubject, consumerName)
+	logger.Info("listening for jokes", "subject", filterSubject, "consumer", consumerName)
 
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- runConsumer(ctx, consumer, nc, spokeID)
 	}()
 
-	fmt.Println("Spoke ready; waiting for jokes from hub...")
+	logger.Info("ready; waiting for jokes from hub")
 
 	select {
 	case <-ctx.Done():
-		fmt.Println("Shutting down spoke")
+		logger.Info("shutting down spoke")
 	case err := <-errCh:
 		if errors.Is(err, context.Canceled) {
-			fmt.Println("Shutting down spoke")
+			logger.Info("shutting down spoke")
 			return
 		}
-		die("spoke stopped: %v", err)
+		shared.Die("spoke stopped: %v", err)
 	}
 }
