@@ -79,11 +79,19 @@ func parseLogLevel(s string) slog.Level {
 // InitLogger configures the default structured logger at the level specified by
 // LOG_LEVEL (default info) and returns a logger that always includes the given
 // component name.
+//
+// When stdout is a terminal, log lines are colorized by level:
+//
+//	ERROR  red + bold
+//	WARN   yellow
+//	INFO   cyan
+//	DEBUG  gray
+//
+// When stdout is piped or redirected, color is disabled automatically.
 func InitLogger(component string) *slog.Logger {
 	level := parseLogLevel(os.Getenv("LOG_LEVEL"))
-	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level:     level,
-		AddSource: false,
+	handler := NewColorHandler(os.Stdout, &ColorHandlerOptions{
+		Level: level,
 	})
 	logger := slog.New(handler).With("component", component)
 	slog.SetDefault(logger)

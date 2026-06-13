@@ -1,6 +1,8 @@
 package shared
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"os"
@@ -31,7 +33,6 @@ func TestParseLogLevel(t *testing.T) {
 }
 
 func TestInitLogger(t *testing.T) {
-	// Save and restore the env var.
 	prev := os.Getenv("LOG_LEVEL")
 	defer os.Setenv("LOG_LEVEL", prev)
 
@@ -41,10 +42,62 @@ func TestInitLogger(t *testing.T) {
 		t.Fatal("InitLogger returned nil")
 	}
 
-	// The logger should include the component attribute.
-	// We can verify it produces output with the expected level set.
-	// Write to a buffer? slog.NewTextHandler writes to os.Stdout by default.
-	// Here we only verify the function does not panic and returns a non-nil logger.
+	// Verify that the logger is enabled at debug level.
+	if !logger.Enabled(context.Background(), slog.LevelDebug) {
+		t.Error("logger should be enabled at debug level when LOG_LEVEL=debug")
+	}
+}
+
+func TestColorHandlerNonTerminal(t *testing.T) {
+	// When not writing to a terminal, color should be off.
+	var buf bytes.Buffer
+	h := NewColorHandler(&buf, &ColorHandlerOptions{Level: slog.LevelDebug})
+	logger := slog.New(h)
+
+	logger.Info("hello", "key", "value")
+
+	output := buf.String()
+	if output == "" {
+		t.Fatal("handler produced no output")
+	}
+
+	// Non-terminal output must not contain ANSI escape sequences.
+	if strings.Contains(output, "\033[") {
+		t.Error("non-terminal output should not contain ANSI escape codes")
+	}
+
+	// Should contain the message and key=value.
+	if !strings.Contains(output, "hello") {
+		t.Error("output should contain the message")
+	}
+	if !strings.Contains(output, "key=value") {
+		t.Error("output should contain key=value")
+	}
+}
+
+func TestColorHandlerLevels(t *testing.T) {
+	var buf bytes.Buffer
+	h := NewColorHandler(&buf, &ColorHandlerOptions{Level: slog.LevelInfo})
+	logger := slog.New(h)
+
+	logger.Debug("should be dropped")
+	logger.Info("info message")
+	logger.Warn("warn message")
+	logger.Error("error message")
+
+	output := buf.String()
+	if strings.Contains(output, "should be dropped") {
+		t.Error("debug message should have been filtered at info level")
+	}
+	if !strings.Contains(output, "INFO") {
+		t.Error("output should contain INFO level")
+	}
+	if !strings.Contains(output, "WARN") {
+		t.Error("output should contain WARN level")
+	}
+	if !strings.Contains(output, "ERROR") {
+		t.Error("output should contain ERROR level")
+	}
 }
 
 func TestValidateSpokeID(t *testing.T) {
